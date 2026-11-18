@@ -18,6 +18,7 @@ Self-healing: if Spotify rotates a persisted-query hash or a TOTP secret,
 from __future__ import annotations
 
 import base64
+import datetime as _dt
 import gzip
 import hashlib
 import hmac
@@ -207,6 +208,31 @@ def _ig_handle(url: str) -> str:
     return m.group(1).rstrip("/") if m else ""
 
 
+def _scan_release_dates(node, inside: bool, out: list) -> None:
+    """Collect (year, month, day) tuples from release-date objects.
+
+    Only dates nested under the artist's discography (singles, albums,
+    compilations, popular releases) or under appearsOn (features on other
+    people's releases) count — those paths all describe real releases.
+    Spotify returns {"year": 2026, "month": 2, "day": 8, "precision": "DAY"};
+    coarser releases only carry the year (or year+month), in which case the
+    midpoint is assumed (15th of the month, mid-year) so the estimate stays
+    unbiased.
+    """
+    if isinstance(node, dict):
+        for k, v in node.items():
+            if k == "date" and inside and isinstance(v, dict):
+                y, m, d = v.get("year"), v.get("month"), v.get("day")
+                if isinstance(y, int) and 1950 <= y <= 2100:
+                    out.append((y,
+                                m if isinstance(m, int) and 1 <= m <= 12 else 6,
+                                d if isinstance(d, int) and 1 <= d <= 31 else 15))
+            _scan_release_dates(v, inside or k in ("discography", "appearsOn"), out)
+    elif isinstance(node, list):
+        for item in node:
+            _scan_release_dates(item, inside, out)
+
+
 def parse_artist_overview(data: dict) -> dict | None:
     au = (data.get("data") or {}).get("artistUnion") or (data.get("data") or {}).get("artist")
     if not au:
@@ -255,7 +281,53 @@ def parse_artist_overview(data: dict) -> dict | None:
     }
     artist["emails"] = sorted(set(re.findall(
         r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", bio)))
+    dates: list[tuple[int, int, int]] = []
+    _scan_release_dates(au, False, dates)
+    artist["last_release"] = ("%04d-%02d-%02d" % max(dates)) if dates else None
     return artist
+
+
+def release_age_days(artist: dict, now: float | None = None) -> int | None:
+    """Days since the artist's latest release, or None when unknown.
+
+    `now` (unix timestamp) is injectable for tests; defaults to today.
+    """
+    iso = artist.get("last_release")
+    if not iso:
+        return None
+    try:
+        that = _dt.date(*(int(x) for x in str(iso).split("-")))
+    except (ValueError, TypeError):
+        return None
+    today = _dt.date.fromtimestamp(now) if now else _dt.date.today()
+    return max(0, (today - that).days)
+
+
+def release_age_label(days: int | None) -> str:
+    """Human label for a release age: '3d ago', '2w ago', '1mo ago', '?'."""
+    if days is None:
+        return "?"
+    if days < 1:
+        return "today"
+    if days < 7:
+        return f"{days}d ago"
+    if days < 30:
+        return f"{max(1, days // 7)}w ago"
+    if days < 365:
+        return f"{max(1, days // 30)}mo ago"
+    return f"{max(1, days // 365)}y ago"
+
+
+def passes_release_recency(artist: dict, max_days: int) -> bool:
+    """True when the artist released something within the last max_days.
+
+    max_days <= 0 disables the filter. Unknown release dates pass (a missing
+    date never kills a lead — the overview just did not list one).
+    """
+    if not max_days or max_days <= 0:
+        return True
+    age = release_age_days(artist)
+    return True if age is None else age <= max_days
 
 
 def dm_list_html(rows: list[dict]) -> str:
@@ -282,6 +354,8 @@ def dm_list_html(rows: list[dict]) -> str:
         name = escape(str(r.get("name") or "Unnamed"))
         ml = _num(r.get("monthly_listeners"))
         ml_s = f"{ml:,} monthly listeners" if ml is not None else "monthly listeners unknown"
+        rel = str(r.get("last_release") or "")
+        rel_s = f" · {escape(rel)}" if rel and rel != "?" else ""
         loc = str(r.get("location") or "")
 
         track = str(r.get("top_track") or "")
@@ -295,7 +369,7 @@ def dm_list_html(rows: list[dict]) -> str:
 
         head = (f'<div style="font-size:19px;font-weight:800;">{name}</div>'
                 f'<div style="color:#666;font-size:13px;margin:2px 0 10px;">{ml_s}'
-                + (f" · {escape(loc)}" if loc else "") + track_line + "</div>")
+                + rel_s + (f" · {escape(loc)}" if loc else "") + track_line + "</div>")
 
         pills = []
         ig_handle = str(r.get("instagram") or "").lstrip("@")
@@ -467,6 +541,14 @@ def _ig_pace(delay: float) -> None:
     _ig_state["last"] = time.time()
 
 
+def _days_since(stamps: list) -> int | None:
+    """Whole days since the newest unix timestamp in the list, or None."""
+    good = [s for s in stamps if isinstance(s, (int, float)) and s > 0]
+    if not good:
+        return None
+    return max(0, int((time.time() - max(good)) // 86400))
+
+
 def _ig_profile_api(handle: str) -> dict | None:
     """Method 1: Instagram's own web endpoint (the one the logged-out site uses)."""
     url = ("https://www.instagram.com/api/v1/users/web_profile_info/?username="
@@ -486,6 +568,9 @@ def _ig_profile_api(handle: str) -> dict | None:
     user = (data.get("data") or {}).get("user") or {}
     if not user:
         return None
+    stamps = [((e or {}).get("node") or {}).get("taken_at_timestamp")
+              for e in ((user.get("edge_owner_to_timeline_media") or {}) 
+                        .get("edges")) or []]
     return {
         "handle": handle,
         "followers": (user.get("edge_followed_by") or {}).get("count"),
@@ -495,6 +580,7 @@ def _ig_profile_api(handle: str) -> dict | None:
         "business_category": user.get("business_category_name") or "",
         "private": bool(user.get("is_private")),
         "verified": bool(user.get("is_verified")),
+        "last_post_days": _days_since(stamps),
     }
 
 
@@ -509,7 +595,7 @@ def _ig_profile_html(handle: str) -> dict | None:
             return m.group(1)
 
     out = {"handle": handle, "followers": None, "bio": "", "full_name": "",
-           "category": "", "business_category": ""}
+           "category": "", "business_category": "", "last_post_days": None}
     m = re.search(r'"edge_followed_by":\{"count":(\d+)\}', html)
     if m:
         out["followers"] = int(m.group(1))
@@ -532,6 +618,8 @@ def _ig_profile_html(handle: str) -> dict | None:
     m = re.search(r'"business_category_name":"((?:[^"\\]|\\.)*)"', html)
     if m:
         out["business_category"] = _js_str(m)
+    stamps = [int(x) for x in re.findall(r'"taken_at_timestamp":(\d{9,14})', html)]
+    out["last_post_days"] = _days_since([s / 1000 if s > 1e11 else s for s in stamps])
     return out if out["followers"] is not None else None
 
 
@@ -597,6 +685,9 @@ def check_instagram(artist: dict, ig_min: int, delay: float = 1.5,
     n = prof.get("followers")
     if n is not None:
         artist["ig_followers"] = n
+    lp = prof.get("last_post_days")
+    if lp is not None:
+        artist["ig_last_post_days"] = lp
     if skip_producers and is_producer(artist, prof):
         return "producer", n
     if n is None:

@@ -125,6 +125,7 @@ def artist_row(artist: dict, source: str) -> dict:
         "name": artist.get("name"),
         "tier": tier_of(ml),
         "monthly_listeners": ml,
+        "last_release": S.release_age_label(S.release_age_days(artist)),
         "location": guess_location(artist),
         "instagram": ("@" + ig) if ig else "",
         "instagram_url": f"https://www.instagram.com/{ig}" if ig else "",
@@ -162,11 +163,13 @@ if "ig_min" not in st.session_state:
 
 def enrich_artists(uris: list[tuple[str, str]], source: str,
                    allowed_region: set[str] | None, lo: int, hi: int,
-                   ig_min: int, skip_prod: bool, delay: float) -> None:
+                   ig_min: int, skip_prod: bool, rel_days: int,
+                   ig_days: int, delay: float) -> None:
     """Fetch overview for each artist, filter, append rows. Shows progress."""
     sp = S.SpotifyAnon(polite_delay=delay)
     prog = st.progress(0.0, text="Starting…")
     hits, skipped_region, skipped_range, skipped_prod, skipped_ig, errors = 0, 0, 0, 0, 0, 0
+    skipped_stale = skipped_quiet = 0
     for i, (uri, name) in enumerate(uris, 1):
         aid = uri.split(":")[-1]
         prog.progress(i / len(uris), text=f"Enriching {i}/{len(uris)} — {name}")
@@ -192,6 +195,9 @@ def enrich_artists(uris: list[tuple[str, str]], source: str,
         if skip_prod and S.is_producer(artist):        # Spotify bio / name — free, no IG call
             skipped_prod += 1
             continue
+        if rel_days and not S.passes_release_recency(artist, rel_days):
+            skipped_stale += 1          # free: date came with the overview call
+            continue
         reason, _n = S.check_instagram(artist, ig_min, delay=delay,
                                        skip_producers=skip_prod)
         if reason == "producer":
@@ -200,11 +206,16 @@ def enrich_artists(uris: list[tuple[str, str]], source: str,
         if reason in ("no_ig", "low"):
             skipped_ig += 1
             continue
+        lp = artist.get("ig_last_post_days")
+        if ig_days and lp is not None and lp > ig_days:
+            skipped_quiet += 1
+            continue
         st.session_state.results.append(artist_row(artist, source))
         hits += 1
     prog.progress(1.0, text="Done")
     st.toast(f"Added {hits} artists (skipped: {skipped_region} region, "
              f"{skipped_range} size, {skipped_prod} producers, "
+             f"{skipped_stale} no release in {rel_days}d, {skipped_quiet} quiet on IG, "
              f"{skipped_ig} instagram, {errors} errors)")
 
 
@@ -250,6 +261,32 @@ with st.sidebar:
                 "no Instagram lookups). Artists with no Instagram linked count "
                 "as 0. If Instagram refuses the lookup, the artist is kept "
                 "with an unknown count — you never lose a lead to a block.")
+
+    st.subheader("🎯 Activity filter")
+    recency_pick = st.selectbox(
+        "Latest release within",
+        ["Off", "60 days", "90 days (recommended)", "120 days"], index=2,
+        help="Artists in a release cycle (promoting a song, planning the next "
+             "one) have budget and urgency; artists who have not dropped "
+             "anything in months are usually dormant. 90 days = released "
+             "music in the last 3 months — singles, albums, compilations and "
+             "features on other artists' releases all count. Artists with "
+             "unknown release dates are kept.")
+    rel_days = {"Off": 0, "60 days": 60,
+                "90 days (recommended)": 90, "120 days": 120}[recency_pick]
+    ig_recency_pick = st.selectbox(
+        "Last Instagram post within",
+        ["Off", "30 days (recommended)"], index=1,
+        help="An artist who released music but never posts is not promoting "
+             "right now — you want artists who are currently visible. Unknown "
+             "(IG blocked or no data) artists are always kept. Needs the "
+             "Instagram lookups to run, i.e. the follower minimum above must "
+             "be over 0.")
+    ig_days = {"Off": 0, "30 days (recommended)": 30}[ig_recency_pick]
+    st.caption("Active artists buy beats — dormant ones don't. 90 days for "
+                "releases and 30 days for Instagram posts are the sweet spot: "
+                "7 days is too narrow (misses artists 3 weeks into promo), "
+                "180 is too broad (6-month-old releases are usually stale).")
 
     st.subheader("🚫 Producer filter")
     skip_prod = st.checkbox(
@@ -306,7 +343,7 @@ with tab_search:
         st.info(f"Found **{len(found)}** unique artists from {len(terms)} terms. "
                 f"Enriching those not already in your results…")
         enrich_artists(list(found.values()), "search", allowed, min_ml, max_ml,
-                       ig_min, skip_prod, delay)
+                       ig_min, skip_prod, rel_days, ig_days, delay)
 
 with tab_playlist:
     st.subheader("Mine artists from playlists")
@@ -349,7 +386,7 @@ with tab_playlist:
         pbar.progress(1.0, text=f"{len(artists)} unique artists found — enriching…")
         st.info(f"Mined **{len(artists)}** unique artists from {len(picked)} playlist(s).")
         enrich_artists(list(artists.values()), "playlist", allowed, min_ml, max_ml,
-                       ig_min, skip_prod, delay)
+                       ig_min, skip_prod, rel_days, ig_days, delay)
 
 with tab_deep:
     st.subheader("Deep search — crawl an artist's radio")
@@ -423,7 +460,7 @@ with tab_deep:
         pbar.progress(1.0, text="Done")
 
         added = skipped_dup = skipped_region = skipped_range = 0
-        skipped_prod = skipped_ig = 0
+        skipped_prod = skipped_ig = skipped_stale = skipped_quiet = 0
         for v in visits:
             artist = v["artist"]
             aid = (artist.get("uri") or "").split(":")[-1]
@@ -441,6 +478,9 @@ with tab_deep:
             if skip_prod and S.is_producer(artist):
                 skipped_prod += 1
                 continue
+            if rel_days and not S.passes_release_recency(artist, rel_days):
+                skipped_stale += 1
+                continue
             reason, _n = S.check_instagram(artist, ig_min, delay=delay,
                                        skip_producers=skip_prod)
             if reason == "producer":
@@ -448,6 +488,10 @@ with tab_deep:
                 continue
             if reason in ("no_ig", "low"):
                 skipped_ig += 1
+                continue
+            lp = artist.get("ig_last_post_days")
+            if ig_days and lp is not None and lp > ig_days:
+                skipped_quiet += 1
                 continue
             st.session_state.results.append(
                 artist_row(artist, f"radio L{v['level']}") if v["level"]
@@ -462,6 +506,12 @@ with tab_deep:
             parts.append(f"{skipped_range} outside the {min_ml:,}–{max_ml:,} listener range")
         if skipped_prod:
             parts.append(f"{skipped_prod} producers/engineers")
+        if skipped_stale:
+            parts.append(f"{skipped_stale} with no release in the last "
+                         f"{rel_days} days")
+        if skipped_quiet:
+            parts.append(f"{skipped_quiet} with no IG post in the last "
+                         f"{ig_days} days")
         if skipped_ig:
             parts.append(f"{skipped_ig} below the {ig_min:,} Instagram-follower minimum")
         summary = f"Visited **{len(visits)}** artists → " + ", ".join(parts) + "."
@@ -469,7 +519,8 @@ with tab_deep:
             st.warning(summary + "\n\n💡 **Nothing new was added.** Either these artists "
                        "are already in your 📋 Results, or the sidebar filters excluded "
                        "them. Most common fix: set **Audience region → Global** in the "
-                       "sidebar, widen the artist size range (tap **Any**), lower the "
+                       "sidebar, widen the artist size range (tap **Any**), set "
+                       "🎯 **Latest release within → Off**, lower the "
                        "Instagram minimum, or turn off the producer filter. To collect "
                        "artists again from scratch, press 🧹 Clear all results.")
         else:
@@ -505,6 +556,7 @@ with tab_results:
                 "tier": st.column_config.TextColumn("Tier", width="small"),
                 "monthly_listeners": st.column_config.NumberColumn("Monthly listeners",
                                                                    format="%,d"),
+                "last_release": st.column_config.TextColumn("Last release", width="small"),
                 "instagram": st.column_config.TextColumn("Instagram", width="small"),
                 "instagram_url": st.column_config.LinkColumn("IG link", display_text="open ↗"),
                 "ig_followers": st.column_config.NumberColumn("IG followers", format="%,d"),
@@ -546,6 +598,7 @@ For every artist it finds, it reads the public Spotify artist page and extracts:
 - **Size filter** — an artist is only saved if their monthly listeners are between your sidebar Min and Max (default **1,000–50,000**: big enough to have a real audience, small enough to actually reply to DMs). Tap a preset (**1k–50k**, **2k–50k**, **Any**) or type your own numbers.
 - **Instagram follower filter** — before an artist is saved, the app checks the public follower count of their Instagram profile (no login, two methods: Instagram's JSON endpoint, then the profile page). Below your minimum (default **1,000**)? Skipped. No Instagram linked? Skipped — you can't DM them anyway. Instagram refuses the lookup (blocks/rate limits)? The artist is **kept** with an unknown count so a block never costs you a lead. Set it to 0 to turn both the filter and the lookups off.
 - **Producer filter** — artists who are also producers or engineers are skipped (they make beats themselves, they don't buy them). Checked on the **Spotify bio + artist name** always, and on the **Instagram bio + display name** whenever the Instagram lookup runs. It looks for standalone words like *producer(s), engineer(s), beatmaker* — credits like "produced by …" do **not** trigger it. Turn it off in the sidebar (🚫 Producer filter) if it ever catches someone you want.
+- **Activity filter (release recency)** — artists in a release cycle are promoting right now, so they have budget and urgency. **Latest release within 90 days** keeps only artists who dropped music in the last 3 months — their newest single, album, compilation, or feature on someone else's release all count (the release dates come free with the artist page, no extra lookups). **Last Instagram post within 30 days** additionally drops artists who are quiet on Instagram: released 2 months ago but no post since = not promoting. Artists with unknown dates are always kept — a missing date never kills a lead. Both live in the sidebar (🎯 Activity filter). Why 90/30? 7 days is too narrow (you'd miss artists 3 weeks into their promo), 180 is too broad (6-month-old releases are usually stale).
 - **Location** — best guess of where the artist is *based*, parsed from the bio ("based in Lagos", "Nigerian singer"...) or their #1 listener city, marked *(audience)*. Spotify publishes no artist-country field, so this column is how to find artists from a specific place — sort by it.
 - **Top track with play count** — so you can pre-qualify before DMing
 - **DM list download** — besides the CSV, the Results tab has "⬇️ Download DM list (HTML)": one small file with every lead as a card of tappable links (Instagram, email, Spotify). It stays in your Downloads and works even when the live results table resets — your DM days never need manual re-searching.
